@@ -1,0 +1,17 @@
+{
+  "PLANNING": {
+    "primary": "claude",
+    "fallback": null,
+    "degraded_allowed": false
+  },
+  "EXECUTION": {
+    "primary": "antigravity",
+    "fallback": null,
+    "degraded_allowed": false
+  },
+  "REVIEW": {
+    "primary": "claude",
+    "fallback": null,
+    "degraded_allowed": false
+  }
+}

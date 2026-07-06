@@ -1,0 +1,228 @@
+import subprocess
+import json
+import re
+import sqlite3
+import os
+import textwrap
+
+from ports.agent_invocation import AgentInvocationPort
+from domain.agent import AgentName
+from domain.errors import AgentQuotaExhaustedError, AgentUnavailableError
+from adapters.quota_classifier import RegexQuotaClassifier
+from ports.capability_store import CapabilityStorePort
+from domain.capability import QuotaStatus
+
+CLAUDE_EXE = r"C:\Users\prakumar113\.local\bin\claude.exe"
+EXECUTION_TIMEOUT_SECONDS = 900
+
+class ClaudeCLIAdapter(AgentInvocationPort):
+    """
+    Claude fills two roles in the pipeline:
+
+    - PLANNING: read the task directly and produce a structured work order JSON.
+    - REVIEW: given the PLANNING work order and what Antigravity produced,
+      judge whether the implementation satisfies the work order and either
+      approve or request changes (which routes the task back to EXECUTION).
+    """
+
+    def __init__(self, classifier: RegexQuotaClassifier, store: CapabilityStorePort):
+        self.classifier = classifier
+        self.store = store
+
+    def invoke(self, task_id: int, role: str, db_path: str, payload: dict) -> dict:
+        if role == "REVIEW":
+            return self._invoke_as_reviewer(task_id, db_path, payload)
+        return self._invoke_as_planner(task_id, db_path, payload)
+
+    def _run_claude_cli(self, prompt: str, project_dir: str | None = None):
+        """Shared subprocess + quota-classification plumbing for both roles.
+
+        `project_dir` is only passed for REVIEW: the reviewer needs to read
+        the actual files Antigravity changed, not just a stdout summary, so
+        it gets `--add-dir` the same way antigravity_cli.py does for EXECUTION.
+        PLANNING doesn't need file access - it plans from the task description
+        alone, before any code exists.
+        """
+        args = [
+            CLAUDE_EXE,
+            "-p",
+            "--permission-mode", "plan",
+            "--output-format", "json",
+            "--no-session-persistence",
+        ]
+        if project_dir:
+            args += ["--add-dir", project_dir]
+        try:
+            result = subprocess.run(
+                args,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=EXECUTION_TIMEOUT_SECONDS,
+            )
+        except FileNotFoundError:
+            # Clean "unavailable" signal instead of leaking a raw OS errno
+            # string up through the API - matches how antigravity_cli.py
+            # reports a missing CLI.
+            raise AgentUnavailableError(f"Claude CLI not found at {CLAUDE_EXE}")
+
+        signal = self.classifier.classify(result.returncode, result.stdout, result.stderr)
+        cap = self.store.get_capability(AgentName.CLAUDE)
+        if cap:
+            cap.quota_status = signal.status
+            if signal.status == QuotaStatus.EXHAUSTED:
+                cap.cooldown_until = signal.retry_after
+            self.store.save_capability(AgentName.CLAUDE, cap)
+
+        if signal.status == QuotaStatus.EXHAUSTED:
+            raise AgentQuotaExhaustedError("Claude usage limit reached")
+        if result.returncode != 0:
+            raise RuntimeError(f"Claude failed: {result.stderr}")
+        return result.stdout.strip()
+
+    def _parse_claude_json(self, raw: str):
+        """Unwrap `claude -p --output-format json`'s outer envelope
+        ({"result": "<json-or-text>"}) and extract the JSON payload from the
+        assistant's actual text.
+
+        Found via a real end-to-end pipeline run: REVIEW explains its
+        reasoning before giving a verdict, so the assistant text is prose
+        ending in a ```json fenced block, not pure JSON. The old
+        implementation only handled pure-JSON text; on prose it fell back to
+        re-scanning the *outer* envelope string (which starts with its own
+        unrelated '{'), silently recovering the envelope itself (no
+        "verdict" key) instead of the assistant's real answer - every REVIEW
+        was misclassified as changes_requested even when Claude said
+        "approved", burning the whole retry budget for nothing. This tries
+        progressively looser strategies against the actual assistant text.
+        """
+        try:
+            outer = json.loads(raw)
+            inner = outer.get("result") or outer.get("content") or raw
+        except json.JSONDecodeError:
+            inner = raw
+
+        if not isinstance(inner, str):
+            return inner
+
+        try:
+            return json.loads(inner)
+        except json.JSONDecodeError:
+            pass
+
+        fenced = re.search(r"```json\s*(\{.*?\})\s*```", inner, re.DOTALL)
+        if fenced:
+            try:
+                return json.loads(fenced.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        start, end = inner.rfind("{"), inner.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(inner[start:end + 1])
+            except json.JSONDecodeError:
+                pass
+
+        return {}
+
+    def _active_project_dir(self, db_path: str) -> str:
+        conn = sqlite3.connect(db_path)
+        row = conn.execute("SELECT path FROM active_project WHERE id=1").fetchone()
+        conn.close()
+        return row[0] if row else os.getcwd()
+
+    # -- PLANNING --------------------------------------------------------------
+
+    def _invoke_as_planner(self, task_id: int, db_path: str, payload: dict) -> dict:
+        conn = sqlite3.connect(db_path)
+        task_row = conn.execute("SELECT title, description FROM tasks WHERE id=?", (task_id,)).fetchone()
+        conn.close()
+        if not task_row:
+            raise ValueError(f"Task {task_id} not found")
+        title, description = task_row
+
+        prompt = textwrap.dedent(f"""
+        You are Claude Code operating in PLAN-ONLY mode. Your job is to read the
+        task below and produce a structured work order as valid JSON with keys:
+        work_order_id, task_summary, implementation_steps (array of strings),
+        risk_assessment ({{level, notes}}), recommended_action.
+
+        ## Task
+        Title      : {title}
+        Description: {description}
+        """).strip()
+
+        raw = self._run_claude_cli(prompt)
+        work_order = self._parse_claude_json(raw)
+
+        # Found via a real run against a task with no description ("hello
+        # world", title only): Claude sometimes doesn't return a structured
+        # work order at all for a too-sparse task, _parse_claude_json
+        # correctly returns {} (there's genuinely no JSON to find), and the
+        # old code stored that {} as a "completed" PLANNING run anyway. Since
+        # PLANNING only ever runs once per task, every later EXECUTION retry
+        # kept re-feeding Antigravity the same empty work order forever -
+        # REVIEW correctly said "nothing to review" 3 times in a row before
+        # the task could ever reach a terminal state. Fail loudly here
+        # instead of silently reporting success with nothing usable.
+        if not work_order or not work_order.get("implementation_steps"):
+            print(f"[claude_cli] PLANNING for task {task_id} produced no usable work order. Raw output:\n{raw}")
+            raise RuntimeError(
+                "Claude did not return a usable work order (no implementation_steps) - "
+                "the task description is probably too sparse to plan from. Add more "
+                "detail to the task and create a new one (PLANNING only runs once per task)."
+            )
+
+        conn = sqlite3.connect(db_path)
+        cur = conn.execute(
+            "INSERT INTO agent_runs (task_id, agent_name, role, status, started_at, completed_at, logs) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)",
+            (task_id, "claude", "PLANNING", "completed", json.dumps(work_order))
+        )
+        run_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+
+        return work_order
+
+    # -- REVIEW ------------------------------------------------------------------
+
+    def _invoke_as_reviewer(self, task_id: int, db_path: str, payload: dict) -> dict:
+        work_order = payload.get("work_order", {})
+        execution_output = payload.get("execution_output", {})
+        project_dir = self._active_project_dir(db_path)
+
+        prompt = textwrap.dedent(f"""
+        You are Claude Code operating as REVIEWER in an automated handoff
+        pipeline. Antigravity just implemented the work order below directly
+        in this project's files (available to you via --add-dir). Inspect the
+        actual code - do not just trust the summary - and decide whether the
+        implementation satisfies the work order.
+
+        Respond with valid JSON only: {{"verdict": "approved" or
+        "changes_requested", "feedback": "<specific, actionable feedback for
+        another implementation pass, or a short approval note>"}}.
+
+        ## Work Order
+        {json.dumps(work_order, indent=2)}
+
+        ## Antigravity's Reported Output
+        {json.dumps(execution_output, indent=2)}
+        """).strip()
+
+        raw = self._run_claude_cli(prompt, project_dir=project_dir)
+        review = self._parse_claude_json(raw)
+        if review.get("verdict") not in ("approved", "changes_requested"):
+            review["verdict"] = "changes_requested"
+            review.setdefault("feedback", "Reviewer did not return a valid verdict; treating as changes requested.")
+
+        conn = sqlite3.connect(db_path)
+        cur = conn.execute(
+            "INSERT INTO agent_runs (task_id, agent_name, role, status, started_at, completed_at, logs) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)",
+            (task_id, "claude", "REVIEW", "completed", json.dumps(review))
+        )
+        run_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+
+        return review

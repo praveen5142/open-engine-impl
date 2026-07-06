@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Open Engine — Handoff MVP</title>
+  <meta name="description" content="Autonomous AI agent handoff chain: Claude (Plan) → Antigravity (Execute) → Claude (Review), with human-gated approval and live telemetry.">
+  <link rel="stylesheet" href="/src/styles.css">
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════════════════════
+     PROJECT GATE  (folder browser overlay — shown until a project
+     folder is selected, and reopenable via "Change Project")
+     There is no native OS file dialog here: this is a plain stdlib
+     HTTP server + browser UI, not an Electron app, so folder
+     selection is done in-app via GET /api/fs/list.
+═══════════════════════════════════════════════════════════ -->
+<div id="project-gate" style="display:none">
+  <div class="project-gate-card">
+    <div class="project-gate-header">
+      <div>
+        <div style="font-size:16px;font-weight:700;color:#e2e8f0">Select a project folder</div>
+        <div style="font-size:12px;color:#94a3b8;margin-top:2px">
+          Tasks and agent runs are scoped to this folder.
+        </div>
+      </div>
+      <button id="btn-close-picker" class="btn btn--ghost btn--sm" style="display:none">Cancel</button>
+    </div>
+    <div id="fs-breadcrumb" class="fs-breadcrumb"></div>
+    <div id="fs-list" class="fs-list"></div>
+    <div class="project-gate-footer">
+      <div id="fs-current-path" class="fs-current-path"></div>
+      <button id="btn-select-folder" class="btn btn--primary" disabled>Use this folder</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     APP SHELL  (three-column grid)
+═══════════════════════════════════════════════════════════ -->
+<div id="app">
+
+  <!-- ── Frame 1: Command Center ──────────────────────────── -->
+  <section class="frame" id="f1">
+
+    <header class="frame-header">
+      <div class="logo"><div class="logo-dot"></div></div>
+      <span class="frame-label">01 — Command Center</span>
+    </header>
+
+    <!-- Active project chip -->
+    <div id="project-chip" class="project-chip"></div>
+
+    <!-- Probe strip -->
+    <div id="probe-strip" style="border-bottom:1px solid var(--clr-border)"></div>
+
+    <!-- Task list (scrollable) -->
+    <div class="frame-body" id="task-list"></div>
+
+    <!-- Create task -->
+    <div class="task-create">
+      <input type="text" id="task-title-input" class="inp"
+             placeholder="New handoff task title…"
+             maxlength="120" autocomplete="off">
+      <textarea id="task-desc-input" class="inp" rows="2"
+                placeholder="Description (optional)…"
+                style="resize:none"></textarea>
+      <button id="btn-create-task" class="btn btn--primary" style="width:100%">
+        + Create Task
+      </button>
+    </div>
+  </section>
+
+  <!-- ── Frame 2: Focus Mode ──────────────────────────────── -->
+  <section class="frame" id="f2">
+
+    <header class="frame-header">
+      <div class="logo"><div class="logo-dot"></div></div>
+      <span class="frame-label">02 — Focus Mode</span>
+      <span id="f2-server-status" style="margin-left:auto;font-size:11px;color:#64748b"></span>
+    </header>
+
+    <!-- Auto-routed delegate control -->
+    <div id="delegate-bar" class="delegate-bar"></div>
+
+    <!-- Pipeline stepper (injected by ui.js) -->
+    <div id="stepper" class="stepper"></div>
+
+    <!-- Main focus content -->
+    <div class="frame-body">
+      <div class="focus-panel" id="focus-panel"></div>
+    </div>
+
+  </section>
+
+  <!-- ── Frame 3: Atomic Review ───────────────────────────── -->
+  <section class="frame" id="f3">
+
+    <header class="frame-header">
+      <div class="logo"><div class="logo-dot"></div></div>
+      <span class="frame-label">03 — Atomic Review</span>
+    </header>
+
+    <div class="frame-body">
+
+      <!-- Approval gates -->
+      <div class="review-section">
+        <button class="review-toggle" aria-expanded="true">
+          <span class="review-toggle-label">
+            <span style="font-size:14px">🔐</span>
+            Approval Gates
+          </span>
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+            <path d="M4 6l3 3 3-3" stroke="#9ca3af" stroke-width="1.5"
+                  stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+        <div class="review-body" id="approval-gates-body"></div>
+      </div>
+
+      <!-- Work order output -->
+      <div class="review-section">
+        <button class="review-toggle" aria-expanded="true">
+          <span class="review-toggle-label">
+            <span style="font-size:14px">📋</span>
+            Work Order
+          </span>
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+            <path d="M4 6l3 3 3-3" stroke="#9ca3af" stroke-width="1.5"
+                  stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+        <div class="review-body" id="work-order-body"></div>
+      </div>
+
+      <!-- Artifacts -->
+      <div class="review-section">
+        <button class="review-toggle" aria-expanded="true">
+          <span class="review-toggle-label">
+            <span style="font-size:14px">📦</span>
+            Artifacts
+          </span>
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+            <path d="M4 6l3 3 3-3" stroke="#9ca3af" stroke-width="1.5"
+                  stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+        <div class="review-body" id="artifacts-body"></div>
+      </div>
+
+      <!-- Audit timeline -->
+      <div class="review-section">
+        <button class="review-toggle" aria-expanded="true">
+          <span class="review-toggle-label">
+            <span style="font-size:14px">🕐</span>
+            Audit Trail
+          </span>
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+            <path d="M4 6l3 3 3-3" stroke="#9ca3af" stroke-width="1.5"
+                  stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+        <div class="review-body" id="timeline-body"></div>
+      </div>
+
+    </div><!-- /frame-body -->
+  </section>
+
+</div><!-- /#app -->
+
+<!-- Status bar -->
+<div id="status-bar">Connecting…</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     BOOTSTRAP
+═══════════════════════════════════════════════════════════ -->
+<script type="module">
+  import State from '/src/state.js';
+  import * as API from '/src/api.js';
+  import { init as initUI } from '/src/ui.js';
+
+  async function boot() {
+    // 1. Mount UI (renders empty states immediately)
+    initUI();
+
+    // 2. Check backend availability
+    const alive = await API.checkServer();
+
+    if (alive) {
+      // 3. Project gate: find out which project folder (if any) is active.
+      //    Tasks/probe/etc. are scoped to it, so this must resolve first.
+      await API.loadProject();
+      if (!State.get().activeProject) {
+        API.openProjectPicker();
+      }
+
+      // 4. Load initial data (loadTasks reads State.activeProject internally)
+      await Promise.all([
+        API.loadTasks(),
+        API.loadProbe(),
+        API.loadApprovals(),
+      ]);
+
+      // 5. Connect SSE for live updates
+      API.connectSSE();
+    } else {
+      State.pushLog('Backend not reachable. Start server: python server.py', 'err');
+    }
+
+    // 5. Wire create-task button
+    const titleInput = document.getElementById('task-title-input');
+    const descInput  = document.getElementById('task-desc-input');
+    const createBtn  = document.getElementById('btn-create-task');
+
+    createBtn.addEventListener('click', async () => {
+      const title = titleInput.value.trim();
+      if (!title) { titleInput.focus(); return; }
+      createBtn.disabled = true;
+      try {
+        await API.createTask(title, descInput.value.trim());
+        titleInput.value = '';
+        descInput.value  = '';
+      } catch(e) {
+        State.pushLog(`Error: ${e.message}`, 'err');
+      } finally {
+        createBtn.disabled = false;
+      }
+    });
+
+    titleInput.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); createBtn.click(); }
+    });
+  }
+
+  boot().catch(err => {
+    console.error('Boot failed:', err);
+    State.pushLog(`Boot error: ${err.message}`, 'err');
+  });
+</script>
+
+</body>
+</html>
