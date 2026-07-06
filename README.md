@@ -57,11 +57,60 @@ to it, and it's also the directory Antigravity actually implements into.
 - Python 3.8+ (backend is stdlib-only: `http.server`, `sqlite3`, `subprocess`
   — nothing to `pip install`)
 - A modern browser
-- `claude` and `agy` (the **Antigravity CLI** — a separate headless agent
-  binary, not the Antigravity IDE, which has no non-interactive mode) on
-  `PATH`. The dashboard's Phase 0 probe reports whether each is installed and
-  currently usable; if either is missing, the corresponding stage HOLDs
-  instead of failing silently.
+- `claude` and `agy` (the **Antigravity CLI**) on `PATH` — see
+  [Setting up the agent CLIs](#setting-up-the-agent-clis) below. The
+  dashboard's Phase 0 probe reports whether each is installed and currently
+  usable; if either is missing, the corresponding stage HOLDs instead of
+  failing silently, so you don't need both installed just to poke around the
+  dashboard itself.
+
+## Setting up the agent CLIs
+
+Both CLIs are found by searching `PATH` at runtime (via Python's
+`shutil.which`) — there's no fixed install location baked into the code, so
+installing either one anywhere your shell can already find it is enough.
+Once installed, the **Phase 0 probe** in Command Center (or `POST
+/api/probe`) is the fastest way to confirm the dashboard can actually see
+each CLI and its version.
+
+### Claude Code CLI (`claude`)
+
+Used for the PLANNING and REVIEW stages.
+
+1. Install it — e.g. `npm install -g @anthropic-ai/claude-code` (needs
+   Node.js), or grab the native installer for your OS. See Anthropic's
+   Claude Code documentation at docs.claude.com for the current options.
+2. Confirm it's on `PATH`: `claude --version`.
+3. Authenticate once: run `claude` interactively and follow the login flow,
+   or set the `ANTHROPIC_API_KEY` environment variable for non-interactive
+   auth (this project always invokes it with `-p` / print mode, so it never
+   opens an interactive session itself — it just needs to already be logged
+   in or have a key in the environment).
+
+### Antigravity CLI (`agy`)
+
+Used for the EXECUTION stage. This is the **headless Antigravity CLI**, a
+separate binary from the Antigravity IDE — the IDE has no non-interactive
+mode and won't work here.
+
+1. Install it per Google's official Antigravity CLI documentation (check
+   their site for the current installer for your OS — not linked here since
+   this isn't something I could verify at the time of writing). The binary
+   is named `agy` (some installs alias it as `antigravity`; this project
+   looks for both, plus the `.exe`/`.cmd` variants on Windows).
+2. Confirm it's on `PATH`: `agy --version`.
+3. This project runs it with `--sandbox`, which needs
+   `"toolPermission": "proceed-in-sandbox"` configured in Antigravity CLI's
+   own settings file (`~/.gemini/antigravity-cli/settings.json` in this
+   project's own setup) so it can implement work orders headlessly without
+   falling back to a blanket `--dangerously-skip-permissions` flag. Confirm
+   the exact settings file location/schema against Antigravity's own docs,
+   since that's an external tool this project doesn't control.
+4. If `agy` genuinely can't be reached (not installed, wrong PATH, etc.),
+   EXECUTION doesn't fail silently — it writes a hand-off inbox file to
+   `handoff-lab/` for a human to process manually (see
+   [Manual hand-off fallback](#manual-hand-off-fallback) below), so a task
+   is never just stuck with no way forward.
 
 ## The pipeline
 

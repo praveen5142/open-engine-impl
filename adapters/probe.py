@@ -14,20 +14,16 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ('utf-8', 'utf-16'
 
 TOOLS = {
     "claude": {
-        "known_path": r"C:\Users\prakumar113\.local\bin\claude.exe",
+        "known_path": None,
         "version_cmd": ["--version"],
     },
     "codex": {
-        "known_path": r"C:\Users\prakumar113\AppData\Roaming\npm\codex.cmd",
+        "known_path": None,
         "version_cmd": ["--version"],
     },
     "antigravity": {
         "known_path": None,
-        "known_path_candidates": [
-            r"C:\Users\prakumar113\AppData\Local\Programs\Antigravity\agy.exe",
-            r"C:\Users\prakumar113\AppData\Local\Programs\Antigravity\bin\agy.exe",
-            r"C:\Users\prakumar113\AppData\Local\Programs\Antigravity\resources\bin\agy.exe",
-        ],
+        "known_path_candidates": [],
         "version_cmd": ["--version"],
     },
 }

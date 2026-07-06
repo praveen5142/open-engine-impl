@@ -1,6 +1,7 @@
 import subprocess
 import json
 import re
+import shutil
 import sqlite3
 import os
 import textwrap
@@ -12,8 +13,18 @@ from adapters.quota_classifier import RegexQuotaClassifier
 from ports.capability_store import CapabilityStorePort
 from domain.capability import QuotaStatus
 
-CLAUDE_EXE = r"C:\Users\prakumar113\.local\bin\claude.exe"
 EXECUTION_TIMEOUT_SECONDS = 900
+
+
+def _find_claude_cli() -> str | None:
+    """Resolve the `claude` binary via PATH so this works on any machine it's
+    installed on, not just the one it was originally developed on (this used
+    to be a hardcoded absolute path tied to one developer's home directory)."""
+    for name in ("claude", "claude.exe", "claude.cmd"):
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
 
 class ClaudeCLIAdapter(AgentInvocationPort):
     """
@@ -43,8 +54,12 @@ class ClaudeCLIAdapter(AgentInvocationPort):
         PLANNING doesn't need file access - it plans from the task description
         alone, before any code exists.
         """
+        claude_path = _find_claude_cli()
+        if not claude_path:
+            raise AgentUnavailableError("Claude CLI ('claude') not found on PATH")
+
         args = [
-            CLAUDE_EXE,
+            claude_path,
             "-p",
             "--permission-mode", "plan",
             "--output-format", "json",
@@ -64,7 +79,7 @@ class ClaudeCLIAdapter(AgentInvocationPort):
             # Clean "unavailable" signal instead of leaking a raw OS errno
             # string up through the API - matches how antigravity_cli.py
             # reports a missing CLI.
-            raise AgentUnavailableError(f"Claude CLI not found at {CLAUDE_EXE}")
+            raise AgentUnavailableError(f"Claude CLI not found at {claude_path}")
 
         signal = self.classifier.classify(result.returncode, result.stdout, result.stderr)
         cap = self.store.get_capability(AgentName.CLAUDE)
