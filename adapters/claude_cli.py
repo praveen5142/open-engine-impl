@@ -48,11 +48,19 @@ class ClaudeCLIAdapter(AgentInvocationPort):
     def _run_claude_cli(self, prompt: str, project_dir: str | None = None):
         """Shared subprocess + quota-classification plumbing for both roles.
 
-        `project_dir` is only passed for REVIEW: the reviewer needs to read
-        the actual files Antigravity changed, not just a stdout summary, so
-        it gets `--add-dir` the same way antigravity_cli.py does for EXECUTION.
-        PLANNING doesn't need file access - it plans from the task description
-        alone, before any code exists.
+        `project_dir` gets passed as `--add-dir` for both roles. REVIEW needs
+        it to read the actual files Antigravity changed, not just a stdout
+        summary. PLANNING needs it too - found via a real run against a task
+        titled "Repo Explaination" for an unrelated project: without
+        --add-dir, Claude has nothing to ground a plan in beyond the task's
+        title/description, so for any "explain/describe the existing repo"
+        style task it silently fell back to whatever's on its own default
+        working directory (this server's own cwd, i.e. this open-engine repo)
+        instead of the actual active project - producing a work order that
+        confidently described the wrong codebase. Not every PLANNING task
+        needs to read files (a brand-new feature has no existing code to
+        read), but there's no way to know that in advance, so always giving
+        it the option is strictly safer than never giving it the option.
         """
         claude_path = _find_claude_cli()
         if not claude_path:
@@ -74,6 +82,18 @@ class ClaudeCLIAdapter(AgentInvocationPort):
                 capture_output=True,
                 text=True,
                 timeout=EXECUTION_TIMEOUT_SECONDS,
+                # Verified live: passing --add-dir alone was NOT enough to
+                # redirect Claude away from the wrong repo. Claude CLI treats
+                # its OS-level cwd (inherited from this server process, i.e.
+                # wherever server.py itself was launched from) as the primary
+                # project, and --add-dir only grants supplementary access to
+                # an extra directory on top of that - it does not replace it.
+                # Every prior test in this session happened to have the
+                # active project be the same directory server.py runs from,
+                # so this never surfaced until a task targeted a genuinely
+                # different project. Setting cwd explicitly makes the target
+                # project Claude's actual primary context.
+                cwd=project_dir or None,
             )
         except FileNotFoundError:
             # Clean "unavailable" signal instead of leaking a raw OS errno
@@ -157,18 +177,27 @@ class ClaudeCLIAdapter(AgentInvocationPort):
             raise ValueError(f"Task {task_id} not found")
         title, description = task_row
 
+        project_dir = self._active_project_dir(db_path)
+
         prompt = textwrap.dedent(f"""
         You are Claude Code operating in PLAN-ONLY mode. Your job is to read the
         task below and produce a structured work order as valid JSON with keys:
         work_order_id, task_summary, implementation_steps (array of strings),
         risk_assessment ({{level, notes}}), recommended_action.
 
+        The project directory is available to you via --add-dir - if the task
+        requires understanding existing code (e.g. explaining, summarizing, or
+        modifying something that already exists), actually read the relevant
+        files before writing the work order instead of guessing. If this is a
+        brand-new feature with nothing to read yet, plan from the task
+        description alone.
+
         ## Task
         Title      : {title}
         Description: {description}
         """).strip()
 
-        raw = self._run_claude_cli(prompt)
+        raw = self._run_claude_cli(prompt, project_dir=project_dir)
         work_order = self._parse_claude_json(raw)
 
         # Found via a real run against a task with no description ("hello

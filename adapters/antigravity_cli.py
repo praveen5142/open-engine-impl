@@ -118,12 +118,20 @@ class AntigravityCLIAdapter(AgentInvocationPort):
             # ~/.gemini/antigravity-cli/settings.json) lets this run headlessly
             # without --dangerously-skip-permissions, which is a blanket
             # permission-bypass flag we deliberately do not use here.
+            #
+            # cwd=project_dir is a defensive addition: claude_cli.py had the
+            # same class of bug (--add-dir alone did not redirect Claude away
+            # from the server process's own cwd), and every prior test of
+            # this adapter happened to have the active project match wherever
+            # server.py itself runs from, so that confound could easily have
+            # masked the same issue here even though it "worked" in testing.
             result = subprocess.run(
                 [agy_path, "--print", "--sandbox", "--add-dir", project_dir, "--print-timeout", "15m"],
                 input=prompt,
                 capture_output=True,
                 text=True,
                 timeout=EXECUTION_TIMEOUT_SECONDS,
+                cwd=project_dir,
             )
         except FileNotFoundError:
             inbox_path = _write_inbox(baton_id, work_order, "Antigravity CLI failed to start", task_id)
