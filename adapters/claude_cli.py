@@ -43,6 +43,8 @@ class ClaudeCLIAdapter(AgentInvocationPort):
     def invoke(self, task_id: int, role: str, db_path: str, payload: dict) -> dict:
         if role == "REVIEW":
             return self._invoke_as_reviewer(task_id, db_path, payload)
+        if role == "SPEC":
+            return self._invoke_as_spec(task_id, db_path, payload)
         return self._invoke_as_planner(task_id, db_path, payload)
 
     def _run_claude_cli(self, prompt: str, project_dir: str | None = None):
@@ -179,6 +181,21 @@ class ClaudeCLIAdapter(AgentInvocationPort):
 
         project_dir = self._active_project_dir(db_path)
 
+        # Phase 2: include research bundle and spec if available
+        research = payload.get("research", {})
+        spec = payload.get("spec", {})
+
+        research_section = ""
+        if research and research.get("snippets"):
+            snippets = research["snippets"]
+            research_section = "\n\n## Research Context (retrieved from memory)\n"
+            for s in snippets[:5]:
+                research_section += f"### {s.get('title', 'Snippet')}\n{s.get('content', '')[:500]}\n\n"
+
+        spec_section = ""
+        if spec and spec.get("acceptance_criteria"):
+            spec_section = f"\n\n## Acceptance Criteria (from SPEC)\n{json.dumps(spec, indent=2)}"
+
         prompt = textwrap.dedent(f"""
         You are Claude Code operating in PLAN-ONLY mode. Your job is to read the
         task below and produce a structured work order as valid JSON with keys:
@@ -195,6 +212,7 @@ class ClaudeCLIAdapter(AgentInvocationPort):
         ## Task
         Title      : {title}
         Description: {description}
+        {research_section}{spec_section}
         """).strip()
 
         raw = self._run_claude_cli(prompt, project_dir=project_dir)
@@ -236,6 +254,14 @@ class ClaudeCLIAdapter(AgentInvocationPort):
         execution_output = payload.get("execution_output", {})
         project_dir = self._active_project_dir(db_path)
 
+        # Phase 2: include verify_command output if present
+        verify_section = ""
+        verify_exit_code = payload.get("verify_exit_code")
+        verify_output = payload.get("verify_output")
+        if verify_exit_code is not None and verify_output is not None:
+            status = "PASSED" if verify_exit_code == 0 else f"FAILED (exit code {verify_exit_code})"
+            verify_section = f"\n\n## Verify Command Output\nStatus: {status}\n```\n{verify_output}\n```"
+
         prompt = textwrap.dedent(f"""
         You are Claude Code operating as REVIEWER in an automated handoff
         pipeline. Antigravity just implemented the work order below directly
@@ -251,7 +277,7 @@ class ClaudeCLIAdapter(AgentInvocationPort):
         {json.dumps(work_order, indent=2)}
 
         ## Antigravity's Reported Output
-        {json.dumps(execution_output, indent=2)}
+        {json.dumps(execution_output, indent=2)}{verify_section}
         """).strip()
 
         raw = self._run_claude_cli(prompt, project_dir=project_dir)
@@ -270,3 +296,74 @@ class ClaudeCLIAdapter(AgentInvocationPort):
         conn.close()
 
         return review
+
+    # -- SPEC (Phase 2) ----------------------------------------------------------
+
+    def _invoke_as_spec(self, task_id: int, db_path: str, payload: dict) -> dict:
+        """Produce a structured acceptance-criteria spec grounded in research.
+
+        Structural template: same shape as _invoke_as_planner (prompt → CLI →
+        parse → validate → insert agent_runs → return).
+
+        Validates that acceptance_criteria is non-empty: an empty/unusable spec
+        must fail loudly (not be recorded as 'completed'), mirroring the
+        implementation_steps guard in _invoke_as_planner.
+        """
+        conn = sqlite3.connect(db_path)
+        task_row = conn.execute("SELECT title, description FROM tasks WHERE id=?", (task_id,)).fetchone()
+        conn.close()
+        if not task_row:
+            raise ValueError(f"Task {task_id} not found")
+        title, description = task_row
+
+        project_dir = self._active_project_dir(db_path)
+        research = payload.get("research", {})
+
+        research_section = ""
+        if research and research.get("snippets"):
+            snippets = research["snippets"]
+            research_section = "\n\n## Research Context (from memory store)\n"
+            for s in snippets[:5]:
+                research_section += f"### {s.get('title', 'Snippet')}\n{s.get('content', '')[:500]}\n\n"
+
+        prompt = textwrap.dedent(f"""
+        You are Claude Code operating as SPEC WRITER in an automated development
+        pipeline. Your job is to author a concise acceptance-criteria spec for
+        the task below, grounded in the research context from the project's
+        memory store.
+
+        Respond with valid JSON only, with keys:
+          spec_id       (a short slug, e.g. "spec-task-{task_id}")
+          objective     (one sentence describing what this task achieves)
+          acceptance_criteria  (array of strings — each is a concrete, testable criterion)
+          out_of_scope  (array of strings — what this task explicitly does NOT do)
+          files_expected (array of strings — file paths likely to be created/modified)
+
+        ## Task
+        Title      : {title}
+        Description: {description}
+        {research_section}
+        """).strip()
+
+        raw = self._run_claude_cli(prompt, project_dir=project_dir)
+        spec = self._parse_claude_json(raw)
+
+        # Validate: acceptance_criteria must be non-empty (mirrors PLANNING's guard)
+        if not spec or not spec.get("acceptance_criteria"):
+            print(f"[claude_cli] SPEC for task {task_id} produced no acceptance_criteria. Raw output:\n{raw}")
+            raise RuntimeError(
+                "Claude did not return a usable spec (no acceptance_criteria) - "
+                "the task description is probably too sparse. Add more detail to the "
+                "task and create a new one."
+            )
+
+        conn = sqlite3.connect(db_path)
+        cur = conn.execute(
+            "INSERT INTO agent_runs (task_id, agent_name, role, status, started_at, completed_at, logs) "
+            "VALUES (?, 'claude', 'SPEC', 'completed', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)",
+            (task_id, json.dumps(spec))
+        )
+        conn.commit()
+        conn.close()
+
+        return spec

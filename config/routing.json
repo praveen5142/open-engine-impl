@@ -1,4 +1,6 @@
 {
+  "RESEARCH": { "primary": "engine", "fallback": null, "degraded_allowed": false },
+  "SPEC":     { "primary": "claude", "fallback": null, "degraded_allowed": false },
   "PLANNING": {
     "primary": "claude",
     "fallback": null,

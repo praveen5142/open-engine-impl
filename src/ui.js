@@ -122,6 +122,8 @@ function renderFocusMode(state) {
   const runs = state.agentRuns[task.id] || [];
   const runByRole = (role) => runs.filter(r => r.role === role).slice(-1)[0];
 
+  const researchRun = runByRole('RESEARCH');
+  const specRun = runByRole('SPEC');
   const planRun = runByRole('PLANNING');
   const execRun = runByRole('EXECUTION');
   const reviewRuns = runs.filter(r => r.role === 'REVIEW');
@@ -142,6 +144,14 @@ function renderFocusMode(state) {
   }
 
   stepperEl.innerHTML = `
+    <div class="step ${stepClass(researchRun)}">
+      <div class="step-dot">🔍</div>
+      <span class="step-label">Research (Engine)</span>
+    </div>
+    <div class="step ${stepClass(specRun)}">
+      <div class="step-dot">📄</div>
+      <span class="step-label">Spec (Claude)</span>
+    </div>
     <div class="step ${stepClass(planRun)}">
       <div class="step-dot">◆</div>
       <span class="step-label">Plan (Claude)</span>
@@ -156,7 +166,7 @@ function renderFocusMode(state) {
     </div>`;
 
   let actionArea = '';
-  const activeRun = [reviewRun, execRun, planRun].find(r => r?.status === 'running');
+  const activeRun = [reviewRun, execRun, planRun, specRun, researchRun].find(r => r?.status === 'running');
   const blockedExec = execRun?.status === 'blocked';
   const changesRequested = reviewVerdict?.verdict === 'changes_requested';
   const approved = reviewVerdict?.verdict === 'approved';
@@ -233,7 +243,7 @@ function renderFocusMode(state) {
     <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
       <div>
         <div style="font-size:15px;font-weight:700;color:#e2e8f0">${escHtml(task.title)}</div>
-        <div style="font-size:12px;color:#94a3b8;margin-top:2px">#${task.id} · ${statusBadge(task.status)}</div>
+        <div style="font-size:12px;color:#94a3b8;margin-top:2px">#${task.id} · ${statusBadge(task.status)}${task.verify_command ? ` · <code style="font-family:var(--txt-mono);font-size:11px;color:#cbd5e1;background:var(--clr-surface);padding:1px 4px;border-radius:3px">${escHtml(task.verify_command)}</code>` : ''}</div>
       </div>
     </div>
     ${actionArea}
@@ -292,21 +302,70 @@ function renderAtomicReview(state) {
     }
   }
 
-  // Work order / agent run output
+  // Research Context
+  const researchBody = el('research-context-body');
+  if (researchBody && task) {
+    const runs = state.agentRuns[task.id] || [];
+    const researchRun = runs.filter(r => r.agent_name === 'engine' && r.role === 'RESEARCH' && r.status === 'completed').slice(-1)[0];
+    if (researchRun?.logs) {
+      try {
+        const resObj = JSON.parse(researchRun.logs);
+        const snippets = resObj.snippets || [];
+        if (!snippets.length) {
+          researchBody.innerHTML = `<div style="font-size:12px;color:#94a3b8;padding:8px 0">No relevant memory snippets found.</div>`;
+        } else {
+          researchBody.innerHTML = snippets.map(s => `
+            <div style="margin-bottom:8px;border:1px solid var(--clr-border);border-radius:var(--r-sm);padding:8px;background:var(--clr-surface)">
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px">
+                <span style="font-weight:600;font-size:12px;color:#e2e8f0">${escHtml(s.title)}</span>
+                <span class="badge ${s.kind === 'wisdom' ? 'badge--warn' : 'badge--ok'}">${escHtml(s.kind)}</span>
+              </div>
+              <div style="font-size:11px;color:#94a3b8;white-space:pre-wrap">${escHtml(s.content)}</div>
+            </div>`).join('');
+        }
+      } catch (e) {
+        researchBody.innerHTML = `<pre class="json-viewer">${escHtml(researchRun.logs)}</pre>`;
+      }
+    } else {
+      researchBody.innerHTML = `<div style="font-size:12px;color:#94a3b8;padding:8px 0">Research has not run yet</div>`;
+    }
+  }
+
+  // Work order / agent run output + Spec sub-section
   const outputEl = el('work-order-body');
   if (outputEl && task) {
     const runs = state.agentRuns[task.id] || [];
     const planRun = runs.filter(r => r.agent_name === 'claude' && r.role === 'PLANNING' && r.status === 'completed').slice(-1)[0];
+    const specRun = runs.filter(r => r.agent_name === 'claude' && r.role === 'SPEC' && r.status === 'completed').slice(-1)[0];
+
+    let planHtml = `<div style="font-size:12px;color:#94a3b8;padding:8px 0">Work order not yet available</div>`;
     if (planRun?.logs) {
       try {
         const wo = JSON.parse(planRun.logs);
-        outputEl.innerHTML = `<div class="json-viewer">${syntaxHighlight(wo)}</div>`;
+        planHtml = `<div class="json-viewer">${syntaxHighlight(wo)}</div>`;
       } catch(e) {
-        outputEl.innerHTML = `<pre class="json-viewer">${escHtml(planRun.logs)}</pre>`;
+        planHtml = `<pre class="json-viewer">${escHtml(planRun.logs)}</pre>`;
       }
-    } else {
-      outputEl.innerHTML = `<div style="font-size:12px;color:#94a3b8;padding:8px 0">Work order not yet available</div>`;
     }
+
+    let specHtml = '';
+    if (specRun?.logs) {
+      try {
+        const specObj = JSON.parse(specRun.logs);
+        specHtml = `
+          <div style="margin-top: 12px; border-top: 1px solid var(--clr-border); padding-top: 12px">
+            <div style="font-size:11px;font-weight:600;text-transform:uppercase;color:#cbd5e1;margin-bottom:6px">📋 Acceptance Criteria Spec</div>
+            <div class="json-viewer">${syntaxHighlight(specObj)}</div>
+          </div>`;
+      } catch(e) {
+        specHtml = `
+          <div style="margin-top: 12px; border-top: 1px solid var(--clr-border); padding-top: 12px">
+            <div style="font-size:11px;font-weight:600;text-transform:uppercase;color:#cbd5e1;margin-bottom:6px">📋 Acceptance Criteria Spec</div>
+            <pre class="json-viewer">${escHtml(specRun.logs)}</pre>
+          </div>`;
+      }
+    }
+    outputEl.innerHTML = planHtml + specHtml;
   }
 
   // Artifacts
@@ -370,7 +429,7 @@ function renderAtomicReview(state) {
     if (!runs.length) {
       timelineEl.innerHTML = `<div style="font-size:12px;color:#94a3b8;padding:8px 0">No events yet</div>`;
     } else {
-      const dotColors = { codex: '#7c3aed', claude: '#d97706', antigravity: '#0891b2' };
+      const dotColors = { codex: '#7c3aed', claude: '#d97706', antigravity: '#0891b2', engine: '#10b981' };
       timelineEl.innerHTML = `<div class="timeline">${runs.map((r, i) => `
         <div class="tl-item">
           <div class="tl-dot-col">
@@ -419,7 +478,14 @@ function renderProbe(state) {
         ${quotaBit}
       </div>
     </div>`;
-  }).join('');
+  }).join('') + `
+    <div class="probe-row" style="border-bottom:none">
+      <span class="probe-tool" style="color:var(--clr-ok)">memory_store</span>
+      <div style="display:flex;align-items:center;gap:6px">
+        <span class="badge badge--ok" title="Active indexing tier">FTS5 (SQLite)</span>
+      </div>
+    </div>`;
+
   probeEl.querySelectorAll('.btn-reset-cap').forEach(b => {
     b.addEventListener('click', () => API.resetCapability(b.dataset.agent));
   });
@@ -498,12 +564,40 @@ function renderStatusBar(state) {
   }
 }
 
+// ── Knowledge panel ──────────────────────────────────────────────────────────
+
+function renderKnowledge(state) {
+  const panel = el('knowledge-panel');
+  if (!panel) return;
+  const count = state.knowledge?.documents?.length || 0;
+  panel.innerHTML = `
+    <div class="probe-row" style="background: var(--clr-panel); border-bottom: none">
+      <span class="probe-tool" style="display:flex;align-items:center;gap:6px">🧠 Memory Store</span>
+      <div style="display:flex;align-items:center;gap:6px">
+        <span class="badge badge--ok" id="knowledge-count">${count} doc${count === 1 ? '' : 's'}</span>
+        <button class="btn btn--sm btn--ghost" id="btn-reindex-knowledge" style="padding: 2px 8px; font-size: 10.5px">Reindex</button>
+      </div>
+    </div>`;
+  el('btn-reindex-knowledge')?.addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    btn.disabled = true;
+    try {
+      await API.reindexKnowledge();
+    } catch (e) {
+      console.warn('Reindex error:', e);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
 // ── Main render ───────────────────────────────────────────────────────────────
 
 function render(state) {
   try { renderProjectGate(state); } catch(e) { console.warn('project gate render:', e); }
   try { renderProjectChip(state); } catch(e) { console.warn('project chip render:', e); }
   try { renderProbe(state); } catch(e) { console.warn('probe render:', e); }
+  try { renderKnowledge(state); } catch(e) { console.warn('knowledge render:', e); }
   try { renderCommandCenter(state); } catch(e) { console.warn('f1 render:', e); }
   try { renderDelegateBar(state); } catch(e) { console.warn('delegate bar render:', e); }
   try { renderFocusMode(state); } catch(e) { console.warn('f2 render:', e); }

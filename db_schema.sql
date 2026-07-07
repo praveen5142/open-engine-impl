@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   title       TEXT NOT NULL,
   description TEXT,
   project_path TEXT,
+  verify_command TEXT,
   status      TEXT CHECK(status IN ('pending','active','completed','blocked')) DEFAULT 'pending',
   created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -23,8 +24,8 @@ CREATE TABLE IF NOT EXISTS active_project (
 CREATE TABLE IF NOT EXISTS agent_runs (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   task_id      INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
-  agent_name   TEXT CHECK(agent_name IN ('codex','claude','antigravity')),
-  role         TEXT CHECK(role IN ('PLANNING','EXECUTION','REVIEW')),
+  agent_name   TEXT CHECK(agent_name IN ('claude','antigravity','engine')),
+  role         TEXT CHECK(role IN ('RESEARCH','SPEC','PLANNING','EXECUTION','REVIEW')),
   status       TEXT CHECK(status IN ('pending','running','completed','failed','blocked','quota_exceeded','skipped_degraded')) DEFAULT 'pending',
   started_at   TIMESTAMP,
   completed_at TIMESTAMP,
@@ -81,4 +82,44 @@ CREATE TABLE IF NOT EXISTS routing_decisions (
   chosen_agent  TEXT,
   reason        TEXT,          -- 'primary_available' | 'fallback_quota' | 'fallback_unavailable' | 'hold'
   created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Phase 1: Open-Brain memory layer (FTS5 keyword search + optional vector tier)
+CREATE TABLE IF NOT EXISTS knowledge_documents (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_path  TEXT,
+  title        TEXT NOT NULL,
+  content      TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  kind         TEXT CHECK(kind IN ('rule','wisdom','reference')) NOT NULL,
+  task_id      INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+  created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- FTS5 external-content table: triggers below keep it in sync with knowledge_documents.
+-- Without the triggers the FTS index silently goes stale.
+CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
+  title, content, content='knowledge_documents', content_rowid='id'
+);
+
+CREATE TRIGGER IF NOT EXISTS knowledge_documents_ai AFTER INSERT ON knowledge_documents BEGIN
+  INSERT INTO knowledge_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS knowledge_documents_ad AFTER DELETE ON knowledge_documents BEGIN
+  INSERT INTO knowledge_fts(knowledge_fts, rowid, title, content) VALUES ('delete', old.id, old.title, old.content);
+END;
+CREATE TRIGGER IF NOT EXISTS knowledge_documents_au AFTER UPDATE ON knowledge_documents BEGIN
+  INSERT INTO knowledge_fts(knowledge_fts, rowid, title, content) VALUES ('delete', old.id, old.title, old.content);
+  INSERT INTO knowledge_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
+END;
+
+-- Optional vector tier: populated only if an embedding provider is configured.
+-- Created regardless so a fresh install doesn't need conditional logic.
+CREATE TABLE IF NOT EXISTS knowledge_vectors (
+  doc_id      INTEGER REFERENCES knowledge_documents(id) ON DELETE CASCADE,
+  chunk_index INTEGER NOT NULL,
+  chunk_text  TEXT NOT NULL,
+  embedding   BLOB,
+  PRIMARY KEY (doc_id, chunk_index)
 );

@@ -18,6 +18,7 @@ export const State = (() => {
     activeProject: null,        // {path, name} or null → gates the dashboard
     projectPickerOpen: false,   // true while the folder-browser overlay is shown
     fsBrowser: { path: '', parent: null, entries: [] },
+    knowledge: { by_kind: {}, documents: [] },
   };
 
   const _listeners = new Set();

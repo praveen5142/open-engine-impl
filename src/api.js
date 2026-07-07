@@ -62,10 +62,32 @@ export async function loadProbe() {
   State.set({ probeResults: probe });
 }
 
+export async function loadKnowledge() {
+  try {
+    const knowledge = await api_get('/api/knowledge');
+    State.set({ knowledge });
+  } catch (e) {
+    State.pushLog(`Error loading knowledge: ${e.message}`, 'err');
+  }
+}
+
+export async function reindexKnowledge() {
+  State.pushLog('Reindexing knowledge base...', 'info');
+  try {
+    const result = await api_post('/api/knowledge/reindex', {});
+    State.pushLog(`Reindex complete: ${result.created} created, ${result.updated} updated, ${result.unchanged} unchanged`, 'ok');
+    await loadKnowledge();
+    return result;
+  } catch (e) {
+    State.pushLog(`Reindex failed: ${e.message}`, 'err');
+    throw e;
+  }
+}
+
 // ── Actions ────────────────────────────────────────────────────────────────────
 
-export async function createTask(title, description = '') {
-  const task = await api_post('/api/tasks', { title, description });
+export async function createTask(title, description = '', verifyCommand = '') {
+  const task = await api_post('/api/tasks', { title, description, verify_command: verifyCommand });
   State.set(s => ({ tasks: s.tasks.some(t => t.id === task.id) ? s.tasks : [task, ...s.tasks], activeTaskId: task.id }));
   State.pushLog(`Task #${task.id} created`, 'ok');
   return task;
@@ -249,6 +271,7 @@ const SSE_HANDLERS = {
   hold_declared:         (d) => { State.pushLog(`HOLD on task #${d.task_id} (${d.role}): ${d.reason}`, 'err'); if(State.get().activeTaskId===d.task_id) loadTask(d.task_id); },
   project_selected:      (d) => { State.pushLog(`Project changed: ${d.name}`, 'info'); },
   capability_reset:      (d) => { State.pushLog(`${d.agent}: cooldown cleared`, 'warn'); loadProbe(); },
+  knowledge_reindexed:   (d) => { State.pushLog(`Knowledge base reindexed: ${d.created} created, ${d.updated} updated, ${d.unchanged} unchanged`, 'ok'); loadKnowledge(); },
 };
 
 export function connectSSE() {

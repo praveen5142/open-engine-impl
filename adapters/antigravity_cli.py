@@ -107,10 +107,17 @@ class AntigravityCLIAdapter(AgentInvocationPort):
         # notion of "workspace" is independent of the subprocess's cwd (verified
         # live: without --add-dir it silently wrote into its own
         # ~/.gemini/antigravity-cli/scratch/ directory instead of the project).
+        # Phase 2: include spec in the prompt so Antigravity knows what
+        # acceptance criteria it needs to satisfy.
+        spec = payload.get("spec", {})
+        spec_section = ""
+        if spec and spec.get("acceptance_criteria"):
+            spec_section = "\n\n## Acceptance Criteria (from SPEC)\n" + json.dumps(spec, indent=2)
+
         prompt = (
             "You are Antigravity acting as the EXECUTION agent in an automated "
             "handoff pipeline. Implement the work order below directly in this "
-            "project's files.\n\n## Work Order\n" + json.dumps(work_order, indent=2)
+            "project's files.\n\n## Work Order\n" + json.dumps(work_order, indent=2) + spec_section
         )
 
         try:

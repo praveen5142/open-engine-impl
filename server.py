@@ -128,6 +128,7 @@ def _migrate_schema(conn):
     #    and safe; SQLite has no "ADD COLUMN IF NOT EXISTS", so check first).
     column_additions = [
         ("tasks", "project_path", "TEXT"),
+        ("tasks", "verify_command", "TEXT"),
         ("capability_probe", "quota_status", "TEXT DEFAULT 'unknown'"),
         ("capability_probe", "quota_confidence", "REAL DEFAULT 1.0"),
         ("capability_probe", "quota_evidence", "TEXT"),
@@ -137,6 +138,7 @@ def _migrate_schema(conn):
     SAFE_TABLES = {"tasks", "capability_probe", "agent_runs"}
     SAFE_COLUMNS = {
         "project_path",
+        "verify_command",
         "quota_status",
         "quota_confidence",
         "quota_evidence",
@@ -168,7 +170,11 @@ def _migrate_schema(conn):
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_runs'"
     ).fetchone()
-    if row and row[0] and "skipped_degraded" not in row[0]:
+    # Rebuild agent_runs if it still uses the old constraint (no 'engine' agent_name,
+    # no RESEARCH/SPEC roles). The check for 'skipped_degraded' covers the first-ever
+    # rebuild (pre-Phase-2 databases); the check for 'engine' covers post-Phase-1
+    # databases that already have 'skipped_degraded' but not 'engine'.
+    if row and row[0] and ("skipped_degraded" not in row[0] or "engine" not in row[0]):
         conn.execute("PRAGMA foreign_keys=OFF")
         # IMPORTANT: by default SQLite's `ALTER TABLE ... RENAME TO` rewrites
         # *other* tables' REFERENCES clauses to follow the rename - so
@@ -186,7 +192,8 @@ def _migrate_schema(conn):
             CREATE TABLE agent_runs (
               id           INTEGER PRIMARY KEY AUTOINCREMENT,
               task_id      INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
-              agent_name   TEXT CHECK(agent_name IN ('codex','claude','antigravity')),
+              agent_name   TEXT CHECK(agent_name IN ('claude','antigravity','engine')),
+              role         TEXT CHECK(role IN ('RESEARCH','SPEC','PLANNING','EXECUTION','REVIEW')),
               status       TEXT CHECK(status IN ('pending','running','completed','failed','blocked','quota_exceeded','skipped_degraded')) DEFAULT 'pending',
               started_at   TIMESTAMP,
               completed_at TIMESTAMP,
@@ -194,8 +201,8 @@ def _migrate_schema(conn):
             )
         """)
         conn.execute("""
-            INSERT INTO agent_runs (id, task_id, agent_name, status, started_at, completed_at, logs)
-            SELECT id, task_id, agent_name, status, started_at, completed_at, logs FROM agent_runs_old
+            INSERT INTO agent_runs (id, task_id, agent_name, role, status, started_at, completed_at, logs)
+            SELECT id, task_id, agent_name, role, status, started_at, completed_at, logs FROM agent_runs_old
         """)
         conn.execute("DROP TABLE agent_runs_old")
         conn.execute("PRAGMA legacy_alter_table=OFF")
@@ -230,6 +237,43 @@ def _migrate_schema(conn):
         """)
         conn.execute("DROP TABLE approval_gates_old")
 
+    # Phase 1: Add knowledge_documents, knowledge_fts, triggers, and
+    # knowledge_vectors. CREATE TABLE/VIRTUAL TABLE/TRIGGER IF NOT EXISTS is
+    # safe to run unconditionally — it's a no-op when the objects already exist.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS knowledge_documents (
+          id           INTEGER PRIMARY KEY AUTOINCREMENT,
+          source_path  TEXT,
+          title        TEXT NOT NULL,
+          content      TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          kind         TEXT CHECK(kind IN ('rule','wisdom','reference')) NOT NULL,
+          task_id      INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+          created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
+          title, content, content='knowledge_documents', content_rowid='id'
+        );
+        CREATE TRIGGER IF NOT EXISTS knowledge_documents_ai AFTER INSERT ON knowledge_documents BEGIN
+          INSERT INTO knowledge_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS knowledge_documents_ad AFTER DELETE ON knowledge_documents BEGIN
+          INSERT INTO knowledge_fts(knowledge_fts, rowid, title, content) VALUES ('delete', old.id, old.title, old.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS knowledge_documents_au AFTER UPDATE ON knowledge_documents BEGIN
+          INSERT INTO knowledge_fts(knowledge_fts, rowid, title, content) VALUES ('delete', old.id, old.title, old.content);
+          INSERT INTO knowledge_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
+        END;
+        CREATE TABLE IF NOT EXISTS knowledge_vectors (
+          doc_id      INTEGER REFERENCES knowledge_documents(id) ON DELETE CASCADE,
+          chunk_index INTEGER NOT NULL,
+          chunk_text  TEXT NOT NULL,
+          embedding   BLOB,
+          PRIMARY KEY (doc_id, chunk_index)
+        );
+    """)
+
     conn.commit()
 
 
@@ -262,6 +306,8 @@ ROUTE_RUN_POLL = re.compile(r"^/api/run/(\d+)/poll$")
 
 ROUTE_ARTIFACT_OPEN = re.compile(r"^/api/artifacts/(\d+)/open$")
 ROUTE_TASK_DELEGATE = re.compile(r"^/api/tasks/(\d+)/delegate$")
+
+KNOWLEDGE_BASE_DIR = os.path.join(BASE_DIR, "knowledge_base")
 
 
 def _is_safe_path(path: str) -> bool:
@@ -380,6 +426,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._get_project()
             elif p == "/api/fs/list":
                 self._fs_list(parse_qs(parsed.query))
+            elif p == "/api/knowledge":
+                self._get_knowledge()
+            elif p == "/api/knowledge/search":
+                self._search_knowledge(parse_qs(parsed.query))
             else:
                 self._send_error(404, "Not found")
         except HTTPError:
@@ -410,6 +460,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._set_project()
             elif p == "/api/capability/reset":
                 self._reset_capability()
+            elif p == "/api/knowledge/reindex":
+                self._reindex_knowledge()
             else:
                 self._send_error(404, "Not found")
         except HTTPError:
@@ -459,9 +511,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with get_db_conn() as db:
             active = db.execute("SELECT path FROM active_project WHERE id=1").fetchone()
             project_path = body.get("project_path") or (active["path"] if active else None)
+            verify_command = body.get("verify_command") or None  # optional — same pattern as description
             cur = db.execute(
-                "INSERT INTO tasks (title, description, project_path) VALUES (?,?,?)",
-                (title, body.get("description", ""), project_path)
+                "INSERT INTO tasks (title, description, project_path, verify_command) VALUES (?,?,?,?)",
+                (title, body.get("description", ""), project_path, verify_command)
             )
             task_id = cur.lastrowid
             db.commit()
@@ -508,6 +561,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # blocked for manual follow-up outside the pipeline.
             if gate["action_type"] == "review_decision" and decision == "approved":
                 db.execute("UPDATE tasks SET status='completed' WHERE id=?", (gate["task_id"],))
+                # Phase 2: wisdom write-back on gate approval (the manual resolution
+                # path). The auto-pipeline path is handled inside OrchestrationService.
+                task_id = gate["task_id"]
+                task_row = db.execute("SELECT title FROM tasks WHERE id=?", (task_id,)).fetchone()
+                # Check whether wisdom already written (dedup guard — same shape as gate dedup)
+                existing_wisdom = db.execute(
+                    "SELECT id FROM knowledge_documents WHERE kind='wisdom' AND task_id=?",
+                    (task_id,)
+                ).fetchone()
+                if not existing_wisdom and task_row:
+                    try:
+                        from adapters.sqlite_memory import SQLiteMemoryStore
+                        mem = SQLiteMemoryStore(DB_PATH)
+                        mem.write_wisdom(task_id, f"Task '{task_row['title']}' completed via human gate approval.")
+                    except Exception:
+                        pass  # wisdom write-back must never break the approval flow
             db.commit()
             row = dict(db.execute("SELECT * FROM approval_gates WHERE id=?", (gate_id,)).fetchone())
             task = dict(db.execute("SELECT * FROM tasks WHERE id=?", (gate["task_id"],)).fetchone())
@@ -597,17 +666,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         from adapters.quota_classifier import RegexQuotaClassifier
         from adapters.claude_cli import ClaudeCLIAdapter
         from adapters.antigravity_cli import AntigravityCLIAdapter
+        from adapters.sqlite_memory import SQLiteMemoryStore, MemoryResearchInvoker
 
         policy_svc = RoutingPolicyService(os.path.join(BASE_DIR, "config", "routing.json"))
         store = SQLiteCapabilityStore(DB_PATH)
         notifier = SSENotifier(_broadcast)
         classifier = RegexQuotaClassifier()
+        memory_store = SQLiteMemoryStore(DB_PATH)
 
         invokers = {
             AgentName.CLAUDE: ClaudeCLIAdapter(classifier, store),
-            AgentName.ANTIGRAVITY: AntigravityCLIAdapter(classifier, store)
+            AgentName.ANTIGRAVITY: AntigravityCLIAdapter(classifier, store),
+            AgentName.ENGINE: MemoryResearchInvoker(memory_store),
         }
-        return OrchestrationService(DB_PATH, policy_svc, store, notifier, invokers)
+        return OrchestrationService(DB_PATH, policy_svc, store, notifier, invokers,
+                                    memory_store=memory_store)
 
     def _execute_leg(self, orchestrator, task_id: int, role: str, body: dict) -> dict:
         """Run one leg (PLANNING/EXECUTION/REVIEW) and broadcast its outcome
@@ -741,6 +814,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_error(403, "Permission denied")
         except Exception as e:
             self._send_error(500, str(e))
+
+    # -- Knowledge endpoints (Phase 1) --------------------------------------------
+
+    def _reindex_knowledge(self):
+        """POST /api/knowledge/reindex — walk knowledge_base/ and ingest all .md/.txt files.
+
+        Returns {"created": n, "updated": n, "unchanged": n, "errors": n}.
+        Idempotent: unchanged files produce no DB write and don't bump updated_at.
+        """
+        from adapters.sqlite_memory import SQLiteMemoryStore
+        store = SQLiteMemoryStore(DB_PATH)
+        counts = {"created": 0, "updated": 0, "unchanged": 0, "errors": 0}
+        if not os.path.isdir(KNOWLEDGE_BASE_DIR):
+            return self._send_json(200, counts)
+        for fname in os.listdir(KNOWLEDGE_BASE_DIR):
+            if not (fname.endswith(".md") or fname.endswith(".txt")):
+                continue
+            fpath = os.path.join(KNOWLEDGE_BASE_DIR, fname)
+            result = store.ingest(fpath, kind="rule")
+            status = result.get("status", "errors")
+            if status in counts:
+                counts[status] += 1
+            else:
+                counts["errors"] += 1
+        _broadcast("knowledge_reindexed", counts)
+        self._send_json(200, counts)
+
+    def _get_knowledge(self):
+        """GET /api/knowledge — return document counts by kind + all documents."""
+        from adapters.sqlite_memory import SQLiteMemoryStore
+        store = SQLiteMemoryStore(DB_PATH)
+        self._send_json(200, {
+            "by_kind": store.counts_by_kind(),
+            "documents": store.get_all_documents(),
+        })
+
+    def _search_knowledge(self, query: dict):
+        """GET /api/knowledge/search?q=... — FTS5 search over knowledge_documents."""
+        from adapters.sqlite_memory import SQLiteMemoryStore
+        q = (query.get("q", [""])[0] or "").strip()
+        if not q:
+            return self._send_json(200, [])
+        store = SQLiteMemoryStore(DB_PATH)
+        results = store.search(q)
+        self._send_json(200, results)
 
     # -- Capability override ------------------------------------------------------
 

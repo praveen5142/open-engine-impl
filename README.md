@@ -236,3 +236,30 @@ artifacts, approval gates, routing decisions, and the currently selected
 project are all persisted there, so the dashboard survives a server restart.
 `routing_decisions` is still recorded on every stage for auditing (queryable
 directly via SQLite) even though it's no longer shown in the dashboard UI.
+
+## MCP Server
+
+Open Engine includes a standalone Model Context Protocol (MCP) server in `mcp_server.py`. It is stdlib-only and communicates over `stdio` using newline-delimited JSON-RPC 2.0. This allows MCP-compatible clients (like Claude Code or Claude Desktop) to query, search, and extend the Open Engine memory base.
+
+### Registration
+
+To configure the server for **Claude Code**, add it to your global MCP configuration (usually under `~/.modelcontextprotocol/config.json` or equivalent):
+
+```json
+{
+  "mcpServers": {
+    "open-engine": {
+      "command": "python",
+      "args": ["c:/development/workspace/open-engine/mcp_server.py"]
+    }
+  }
+}
+```
+
+*Note: Ensure the absolute path points correctly to your `mcp_server.py` location.*
+
+### Tools Provided
+
+- `search_knowledge(query, k=5)`: Retrieve relevant snippets (rules, reference materials, wisdom) from the memory store matching the keywords.
+- `get_document(id)`: Fetch full document text and metadata by its integer ID.
+- `add_rule(title, content)`: Programmatically insert a rule into the knowledge base.

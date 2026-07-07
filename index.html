@@ -55,6 +55,9 @@
     <!-- Probe strip -->
     <div id="probe-strip" style="border-bottom:1px solid var(--clr-border)"></div>
 
+    <!-- Knowledge panel -->
+    <div id="knowledge-panel" style="border-bottom:1px solid var(--clr-border)"></div>
+
     <!-- Task list (scrollable) -->
     <div class="frame-body" id="task-list"></div>
 
@@ -66,6 +69,9 @@
       <textarea id="task-desc-input" class="inp" rows="2"
                 placeholder="Description (optional)…"
                 style="resize:none"></textarea>
+      <input type="text" id="task-verify-input" class="inp"
+             placeholder="Verify command (e.g. pytest)…"
+             maxlength="200" autocomplete="off">
       <button id="btn-create-task" class="btn btn--primary" style="width:100%">
         + Create Task
       </button>
@@ -117,6 +123,20 @@
           </svg>
         </button>
         <div class="review-body" id="approval-gates-body"></div>
+      </div>
+      <!-- Research Context -->
+      <div class="review-section">
+        <button class="review-toggle" aria-expanded="false">
+          <span class="review-toggle-label">
+            <span style="font-size:14px">🧠</span>
+            Research Context
+          </span>
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+            <path d="M4 6l3 3 3-3" stroke="#9ca3af" stroke-width="1.5"
+                  stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+        <div class="review-body" id="research-context-body" style="display:none"></div>
       </div>
 
       <!-- Work order output -->
@@ -200,6 +220,7 @@
         API.loadTasks(),
         API.loadProbe(),
         API.loadApprovals(),
+        API.loadKnowledge(),
       ]);
 
       // 5. Connect SSE for live updates
@@ -211,6 +232,7 @@
     // 5. Wire create-task button
     const titleInput = document.getElementById('task-title-input');
     const descInput  = document.getElementById('task-desc-input');
+    const verifyInput = document.getElementById('task-verify-input');
     const createBtn  = document.getElementById('btn-create-task');
 
     createBtn.addEventListener('click', async () => {
@@ -218,9 +240,10 @@
       if (!title) { titleInput.focus(); return; }
       createBtn.disabled = true;
       try {
-        await API.createTask(title, descInput.value.trim());
+        await API.createTask(title, descInput.value.trim(), verifyInput.value.trim());
         titleInput.value = '';
         descInput.value  = '';
+        verifyInput.value = '';
       } catch(e) {
         State.pushLog(`Error: ${e.message}`, 'err');
       } finally {
