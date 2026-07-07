@@ -92,19 +92,36 @@ def get_db_conn() -> sqlite3.Connection:
         conn.close()
 
 
+# Single source of truth for the additive-migration allowlist, shared by
+# _column_exists() and _migrate_schema() below. Previously each function
+# kept its own separate copy of this set - they drifted out of sync when
+# _migrate_schema's copy was updated to add 'verify_command' (for the RSPBV
+# verify-command column) but _column_exists's independent copy wasn't,
+# so _migrate_schema's own call to _column_exists(conn, "tasks",
+# "verify_command") raised "Unsafe column name" and crashed server startup
+# entirely - found the hard way when the preview server failed to boot.
+MIGRATION_SAFE_TABLES = {"tasks", "capability_probe", "agent_runs"}
+MIGRATION_SAFE_COLUMNS = {
+    "project_path",
+    "verify_command",
+    "quota_status",
+    "quota_confidence",
+    "quota_evidence",
+    "cooldown_until",
+    "role",
+}
+MIGRATION_SAFE_DECLARATIONS = {
+    "TEXT",
+    "TEXT DEFAULT 'unknown'",
+    "REAL DEFAULT 1.0",
+    "TIMESTAMP",
+}
+
+
 def _column_exists(conn, table, column) -> bool:
-    SAFE_TABLES = {"tasks", "capability_probe", "agent_runs"}
-    SAFE_COLUMNS = {
-        "project_path",
-        "quota_status",
-        "quota_confidence",
-        "quota_evidence",
-        "cooldown_until",
-        "role",
-    }
-    if table not in SAFE_TABLES:
+    if table not in MIGRATION_SAFE_TABLES:
         raise ValueError(f"Unsafe table name: {table}")
-    if column not in SAFE_COLUMNS:
+    if column not in MIGRATION_SAFE_COLUMNS:
         raise ValueError(f"Unsafe column name: {column}")
     return column in [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
 
@@ -135,28 +152,12 @@ def _migrate_schema(conn):
         ("capability_probe", "cooldown_until", "TIMESTAMP"),
         ("agent_runs", "role", "TEXT"),
     ]
-    SAFE_TABLES = {"tasks", "capability_probe", "agent_runs"}
-    SAFE_COLUMNS = {
-        "project_path",
-        "verify_command",
-        "quota_status",
-        "quota_confidence",
-        "quota_evidence",
-        "cooldown_until",
-        "role",
-    }
-    SAFE_DECLARATIONS = {
-        "TEXT",
-        "TEXT DEFAULT 'unknown'",
-        "REAL DEFAULT 1.0",
-        "TIMESTAMP",
-    }
     for table, column, decl in column_additions:
-        if table not in SAFE_TABLES:
+        if table not in MIGRATION_SAFE_TABLES:
             raise ValueError(f"Unsafe table name: {table}")
-        if column not in SAFE_COLUMNS:
+        if column not in MIGRATION_SAFE_COLUMNS:
             raise ValueError(f"Unsafe column name: {column}")
-        if decl not in SAFE_DECLARATIONS:
+        if decl not in MIGRATION_SAFE_DECLARATIONS:
             raise ValueError(f"Unsafe column declaration: {decl}")
         if not _column_exists(conn, table, column):
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
@@ -175,6 +176,15 @@ def _migrate_schema(conn):
     # rebuild (pre-Phase-2 databases); the check for 'engine' covers post-Phase-1
     # databases that already have 'skipped_degraded' but not 'engine'.
     if row and row[0] and ("skipped_degraded" not in row[0] or "engine" not in row[0]):
+        # Defensive: if a previous run of this migration crashed between the
+        # RENAME and the final DROP below (found in this exact database - an
+        # empty, pre-'role'-column agent_runs_old left over from an
+        # interrupted attempt), the RENAME two lines down would fail with
+        # "already another table with this name" and crash server startup
+        # entirely. Any leftover here is by definition superseded (the live
+        # agent_runs table already exists and is what we're about to rebuild
+        # from), so it's always safe to clear before retrying.
+        conn.execute("DROP TABLE IF EXISTS agent_runs_old")
         conn.execute("PRAGMA foreign_keys=OFF")
         # IMPORTANT: by default SQLite's `ALTER TABLE ... RENAME TO` rewrites
         # *other* tables' REFERENCES clauses to follow the rename - so
@@ -218,6 +228,9 @@ def _migrate_schema(conn):
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='approval_gates'"
     ).fetchone()
     if ag_row and ag_row[0] and ("agent_runs_old" in ag_row[0] or "review_decision" not in ag_row[0]):
+        # Same defensive clear as agent_runs_old above - a leftover from an
+        # interrupted prior run would otherwise crash this RENAME too.
+        conn.execute("DROP TABLE IF EXISTS approval_gates_old")
         conn.execute("ALTER TABLE approval_gates RENAME TO approval_gates_old")
         conn.execute("""
             CREATE TABLE approval_gates (
