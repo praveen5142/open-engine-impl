@@ -229,6 +229,16 @@ function _logReview(review) {
   if (review.feedback) State.pushLog(_truncate(review.feedback, 200), 'info');
 }
 
+function _logSpec(spec) {
+  if (spec.objective) State.pushLog(`Spec: ${spec.objective}`, 'ok');
+  for (const criterion of spec.acceptance_criteria || []) {
+    State.pushLog(`  ✓ ${_truncate(String(criterion), 80)}`, 'info');
+  }
+  if ((spec.files_expected || []).length) {
+    State.pushLog(`Files expected: ${spec.files_expected.join(', ')}`, 'info');
+  }
+}
+
 function _logExecutionOutput(logs) {
   const lines = (logs.stdout || '').split('\n').map(l => l.trim()).filter(Boolean).slice(0, 20);
   lines.forEach(line => State.pushLog(line, 'info'));
@@ -255,6 +265,7 @@ const SSE_HANDLERS = {
       const logs = JSON.parse(run.logs);
       if (d.role === 'PLANNING') _logWorkOrder(logs);
       else if (d.role === 'REVIEW') _logReview(logs);
+      else if (d.role === 'SPEC') _logSpec(logs);
     } catch (e) { /* logs weren't JSON-parseable, skip detail formatting */ }
   },
   claude_failed:         (d) => { State.pushLog(`Claude failed: ${d.error}`, 'err'); if(State.get().activeTaskId===d.task_id) loadTask(d.task_id); },

@@ -25,6 +25,9 @@
   --clr-agy:        #0891b2;
   --clr-agy-bg:     #071e22;
   --clr-agy-bd:     #164e63;
+  --clr-engine:     #34d399;
+  --clr-engine-bg:  #052e16;
+  --clr-engine-bd:  #047857;
 
   /* Status */
   --clr-ok:         #34d399;
@@ -145,6 +148,7 @@ body {
 .badge--codex   { background: var(--clr-codex-bg);   color: var(--clr-codex); }
 .badge--claude  { background: var(--clr-claude-bg);  color: var(--clr-claude); }
 .badge--agy     { background: var(--clr-agy-bg);     color: var(--clr-agy); }
+.badge--engine  { background: var(--clr-engine-bg);  color: var(--clr-engine); }
 
 /* ── Pill ─────────────────────────────────────────────────── */
 .pill {

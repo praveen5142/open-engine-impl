@@ -23,7 +23,7 @@ function statusBadge(status) {
 }
 
 function agentBadge(agent) {
-  const map = { codex: 'badge--codex', claude: 'badge--claude', antigravity: 'badge--agy' };
+  const map = { codex: 'badge--codex', claude: 'badge--claude', antigravity: 'badge--agy', engine: 'badge--engine' };
   return `<span class="badge ${map[agent]||'badge--blocked'}">${agent}</span>`;
 }
 
@@ -125,10 +125,13 @@ function renderFocusMode(state) {
   const researchRun = runByRole('RESEARCH');
   const specRun = runByRole('SPEC');
   const planRun = runByRole('PLANNING');
-  const execRun = runByRole('EXECUTION');
+  const execRuns = runs.filter(r => r.role === 'EXECUTION');
+  const execRun = execRuns.slice(-1)[0];
+  const completedExecCount = execRuns.filter(r => r.status === 'completed').length;
   const reviewRuns = runs.filter(r => r.role === 'REVIEW');
   const reviewRun = reviewRuns.slice(-1)[0];
   const completedReviewCount = reviewRuns.filter(r => r.status === 'completed').length;
+  const retryPill = (count) => count > 1 ? `<span class="badge badge--warn" style="margin-left:4px;padding:1px 5px;font-size:9px">×${count}</span>` : '';
 
   let reviewVerdict = null;
   if (reviewRun?.status === 'completed') {
@@ -158,11 +161,11 @@ function renderFocusMode(state) {
     </div>
     <div class="step ${stepClass(execRun)}">
       <div class="step-dot">✦</div>
-      <span class="step-label">Execute (Antigravity)</span>
+      <span class="step-label">Execute (Antigravity)${retryPill(completedExecCount)}</span>
     </div>
     <div class="step ${stepClass(reviewRun)}">
       <div class="step-dot">◆</div>
-      <span class="step-label">Review (Claude)</span>
+      <span class="step-label">Review (Claude)${retryPill(completedReviewCount)}</span>
     </div>`;
 
   let actionArea = '';
@@ -422,7 +425,10 @@ function renderAtomicReview(state) {
     }
   }
 
-  // Audit timeline
+  // Audit timeline — grouped into a one-time "Setup" leg (Research/Spec/Plan,
+  // each runs once) plus numbered Build↔Verify cycles, instead of one flat
+  // chronological list. A retried task can otherwise show 7+ items in a row
+  // with no way to tell how many cycles happened or what each one decided.
   const timelineEl = el('timeline-body');
   if (timelineEl && task) {
     const runs = state.agentRuns[task.id] || [];
@@ -430,17 +436,66 @@ function renderAtomicReview(state) {
       timelineEl.innerHTML = `<div style="font-size:12px;color:#94a3b8;padding:8px 0">No events yet</div>`;
     } else {
       const dotColors = { codex: '#7c3aed', claude: '#d97706', antigravity: '#0891b2', engine: '#10b981' };
-      timelineEl.innerHTML = `<div class="timeline">${runs.map((r, i) => `
+      const tlItem = (r, isLast) => `
         <div class="tl-item">
           <div class="tl-dot-col">
             <div class="tl-dot" style="background:${dotColors[r.agent_name]||'#9ca3af'}"></div>
-            ${i < runs.length-1 ? '<div class="tl-line"></div>' : ''}
+            ${isLast ? '' : '<div class="tl-line"></div>'}
           </div>
           <div class="tl-text">
             <div class="tl-title">${r.agent_name}${r.role ? ` (${r.role})` : ''} · ${r.status}</div>
             <div class="tl-meta">${r.started_at ? timeAgo(r.started_at) : (r.status === 'pending' ? 'Not started' : '')}</div>
           </div>
-        </div>`).join('')}</div>`;
+        </div>`;
+      const groupCard = (borderColor, inner) =>
+        `<div style="border:1px solid ${borderColor};border-radius:var(--r-sm);background:var(--clr-surface);margin-bottom:8px;padding:8px 10px">${inner}</div>`;
+
+      // Research/Spec/Plan only ever run once per task - no grouping needed,
+      // just list them. Each Build (EXECUTION) run starts a new cycle;
+      // Verify (REVIEW) runs attach to whichever cycle is currently open.
+      const setup = [];
+      const cycles = [];
+      let openCycle = null;
+      for (const r of runs) {
+        if (r.role === 'EXECUTION') {
+          openCycle = { execution: r, review: null };
+          cycles.push(openCycle);
+        } else if (r.role === 'REVIEW') {
+          if (!openCycle) { openCycle = { execution: null, review: null }; cycles.push(openCycle); }
+          openCycle.review = r;
+        } else {
+          setup.push(r);
+        }
+      }
+
+      let html = '';
+      if (setup.length) {
+        html += groupCard('var(--clr-border)', `
+          <div style="font-size:11px;font-weight:600;color:#cbd5e1;margin-bottom:6px">Setup</div>
+          <div class="timeline">${setup.map((r, i) => tlItem(r, i === setup.length - 1)).join('')}</div>`);
+      }
+      cycles.forEach((c, idx) => {
+        let verdict = null;
+        if (c.review?.status === 'completed') {
+          try { verdict = JSON.parse(c.review.logs || '{}').verdict; } catch (e) { /* not JSON, leave null */ }
+        }
+        let label = 'in progress', color = '#94a3b8', border = 'var(--clr-border)';
+        if (c.execution?.status === 'blocked' || c.execution?.status === 'failed' || c.review?.status === 'failed') {
+          label = 'blocked'; color = '#fca5a5'; border = '#f87171';
+        } else if (verdict === 'approved') {
+          label = 'approved'; color = '#6ee7b7'; border = '#6ee7b7';
+        } else if (verdict === 'changes requested' || verdict === 'changes_requested') {
+          label = 'changes requested'; color = '#fbbf24'; border = '#fde68a';
+        }
+        const items = [c.execution, c.review].filter(Boolean);
+        html += groupCard(border, `
+          <div style="display:flex;justify-content:space-between;align-items:baseline;font-size:11px;font-weight:600;margin-bottom:6px">
+            <span style="color:#cbd5e1">Cycle ${idx + 1} of ${cycles.length}</span>
+            <span style="color:${color}">${label}</span>
+          </div>
+          <div class="timeline">${items.map((r, i) => tlItem(r, i === items.length - 1)).join('')}</div>`);
+      });
+      timelineEl.innerHTML = html;
     }
   }
 }
